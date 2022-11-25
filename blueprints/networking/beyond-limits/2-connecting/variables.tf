@@ -3,14 +3,15 @@ variable "network-config" {
   type = map(
     object({
       network_id = string
+      # ASNs stay manual to avoid issues during scale up/down with BGP sessions being recreated
+      asn        = number
       spokes = map(
         object({
           network_id = string
+          # ASNs stay manual to avoid issues during scale up/down with BGP sessions being recreated
+          asn        = number
           regions = map(
             object({
-              asn                       = string
-              peer-asn                  = string
-              bgp-cidr-range            = string
               bgp_announced_cidr_ranges = optional(map(string), {})
             })
           )

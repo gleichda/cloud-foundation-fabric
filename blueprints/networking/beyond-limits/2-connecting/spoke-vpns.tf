@@ -22,9 +22,39 @@ locals {
   vpn-list = merge([
     for project, config in local.vpn-list-helper-region : {
       for region, data in config.regions :
-      "${project}-${region}" => merge(data, { "connectivity-project" = config.connectivity-project, "spoke-project" = project, "region" = region })
+      "${project}-${region}" => merge(
+        data,
+        {
+          "connectivity-project" = config.connectivity-project,
+          "spoke-project"        = project,
+          "region"               = region,
+          #TODO Explain logic
+          #
+          "link-local-cidr" = "169.254.0.${tonumber(regex(local.spoke-number-regex, project)[1]) * 8}/29"
+          "asn"             = config.asn
+        }
+      )
     }
   ]...)
+
+  con-router-list-helper = {
+    for con-project, config in var.network-config :
+    con-project => distinct(flatten([
+      for spoke, data in config.spokes :
+      keys(data.regions)
+    ]))
+  }
+
+  con-router-list = merge([
+    for con-project, regions in local.con-router-list-helper : {
+      for index, region in regions :
+      "${con-project}-${region}" =>
+      {
+        "connectivity-project" = con-project,
+        "region"               = region
+      }
+  }]...)
+
   spoke-gateways-helper = toset([for vpn, config in local.vpn-list :
     {
       "connectivity-project" = config.connectivity-project
@@ -33,9 +63,15 @@ locals {
     }
   ])
 
+
   spoke-gateways = { for gw in local.spoke-gateways-helper :
     "${gw.connectivity-project}-${gw.region}" => gw
   }
+
+  spoke-number-regex = "(con[0-9]+-spoke)([0-9]+)"
+  con-number-regex   = "(con)([0-9]+)"
+  # TODO Variable
+  start-asn = 4200000000
 }
 
 # VPN Gateways need to be created separately in order to avid cyclic dependencies
@@ -57,6 +93,26 @@ resource "google_compute_ha_vpn_gateway" "ha-gateway-con" {
 }
 
 
+resource "google_compute_router" "spoke-router" {
+  for_each = local.con-router-list
+  name     = "vpn-${each.key}"
+  project  = each.value.connectivity-project
+  region   = each.value.region
+  network  = var.network-config[each.value.connectivity-project].network_id
+  bgp {
+    asn            = var.network-config[each.value.connectivity-project].asn
+    advertise_mode = "CUSTOM"
+    dynamic "advertised_ip_ranges" {
+      for_each = var.spoke-cidr-announcements
+      iterator = range
+      content {
+        range       = range.key
+        description = range.value
+      }
+    }
+  }
+}
+
 module "vpn-con-spoke" {
   for_each           = local.vpn-list
   source             = "../../../../modules/net-vpn-ha"
@@ -67,36 +123,30 @@ module "vpn-con-spoke" {
   vpn_gateway        = google_compute_ha_vpn_gateway.ha-gateway-con["${each.value.connectivity-project}-${each.value.region}"].id
   peer_gcp_gateway   = google_compute_ha_vpn_gateway.ha-gateway-spoke["${each.value.spoke-project}-${each.value.region}"].id
   vpn_gateway_create = false
-  router_asn         = each.value.peer-asn
-
-  router_advertise_config = {
-    mode : "CUSTOM",
-    groups : [],
-    ip_ranges : var.spoke-cidr-announcements
-  }
-
+  router_create = false
+  router_name = google_compute_router.spoke-router["${each.value.connectivity-project}-${each.value.region}"].name
 
   tunnels = {
     remote-0 = {
       bgp_peer = {
-        address = cidrhost(each.value.bgp-cidr-range, 1) # First IP except Gateway
+        address = cidrhost(each.value.link-local-cidr, 1) # First IP except Gateway
         asn     = each.value.asn
       }
       bgp_peer_options                = null
-      bgp_session_range               = "${cidrhost(each.value.bgp-cidr-range, 2)}/30"
+      bgp_session_range               = "${cidrhost(each.value.link-local-cidr, 2)}/30"
       ike_version                     = 2
       peer_external_gateway_interface = null
       router                          = null
-      shared_secret         = random_password.vpn-psk[each.key].result
-      vpn_gateway_interface = 0
+      shared_secret                   = random_password.vpn-psk[each.key].result
+      vpn_gateway_interface           = 0
     }
     remote-1 = {
       bgp_peer = {
-        address = cidrhost(each.value.bgp-cidr-range, 5) # First IP of second subnet
+        address = cidrhost(each.value.link-local-cidr, 5) # First IP of second subnet
         asn     = each.value.asn
       }
       bgp_peer_options                = null
-      bgp_session_range               = "${cidrhost(each.value.bgp-cidr-range, 6)}/30" # Always the IP in the CIDR will be used as router IP
+      bgp_session_range               = "${cidrhost(each.value.link-local-cidr, 6)}/30" # Always the IP in the CIDR will be used as router IP
       ike_version                     = 2
       peer_external_gateway_interface = null
       router                          = null
@@ -128,11 +178,11 @@ module "vpn-spoke-con" {
   tunnels = {
     remote-0 = {
       bgp_peer = {
-        address = cidrhost(each.value.bgp-cidr-range, 2) # Second IP except Gateway
-        asn     = each.value.peer-asn
+        address = cidrhost(each.value.link-local-cidr, 2) # Second IP except Gateway
+        asn     = var.network-config[each.value.connectivity-project].asn
       }
       bgp_peer_options                = null
-      bgp_session_range               = "${cidrhost(each.value.bgp-cidr-range, 1)}/30"
+      bgp_session_range               = "${cidrhost(each.value.link-local-cidr, 1)}/30"
       ike_version                     = 2
       peer_external_gateway_interface = null
       router                          = null
@@ -141,11 +191,11 @@ module "vpn-spoke-con" {
     }
     remote-1 = {
       bgp_peer = {
-        address = cidrhost(each.value.bgp-cidr-range, 6) # Second IP of second subnet
-        asn     = each.value.peer-asn
+        address = cidrhost(each.value.link-local-cidr, 6) # Second IP of second subnet
+        asn     = var.network-config[each.value.connectivity-project].asn
       }
       bgp_peer_options                = null
-      bgp_session_range               = "${cidrhost(each.value.bgp-cidr-range, 5)}/30" # cidrsubnet(each.value.bgp-cidr-range, 1, 1)
+      bgp_session_range               = "${cidrhost(each.value.link-local-cidr, 5)}/30"
       ike_version                     = 2
       peer_external_gateway_interface = null
       router                          = null

@@ -12,9 +12,20 @@ output "stage2-input" {
     for con-project, con-config in local.stage0-output :
     con-project => {
       spokes = { for spoke, data in con-config.spokes :
-        spoke => merge(data, { network_id = module.vpc["${spoke}"].network_id, regions = {} })
+        spoke => merge(
+          data,
+          {
+            network_id = module.vpc["${spoke}"].network_id,
+            asn        = 0,
+            regions = {
+              "europe-west4" = {},
+              "us-central1"  = {}
+            }
+          }
+        )
       }
       network_id = module.vpc["${con-project}"].network_id
+      asn        = 0
     }
   }
 }
